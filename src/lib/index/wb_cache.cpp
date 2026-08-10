@@ -565,7 +565,6 @@ void IndexWBCache::recover(sisl::byte_view sb) {
     auto cpg = cp_mgr().cp_guard();
     auto icp_ctx = r_cast< IndexCPContext* >(cpg.context(cp_consumer_t::INDEX_SVC));
     std::map< BlkId, IndexBufferPtr > bufs = icp_ctx->recover(std::move(sb));
-    bool allocator_state_changed{false};
 
     LOGINFOMOD(wbcache, "Detected unclean shutdown, prior cp={} had to flush {} nodes, recovering... ", icp_ctx->id(),
                bufs.size());
@@ -659,7 +658,7 @@ void IndexWBCache::recover(sisl::byte_view sb) {
                 buf->m_node_freed = false;
                 r_cast< persistent_hdr_t* >(buf->m_bytes)->node_deleted = false;
                 auto alloc_status = m_vdev->commit_blk(buf->m_blkid);
-                allocator_state_changed |= (alloc_status == BlkAllocStatus::SUCCESS);
+                HS_REL_ASSERT_EQ(alloc_status, BlkAllocStatus::SUCCESS, "Unsuccessful commit_blk() in recover()");
                 if (buf->m_node_level) { potential_parent_recovered_bufs.insert(buf); }
                 prune_from_up_buffer(buf);
             }
@@ -671,7 +670,7 @@ void IndexWBCache::recover(sisl::byte_view sb) {
                 LOGTRACEMOD(wbcache, "New buffer {} and the up buffer {} are committed", buf->to_string(),
                             buf->m_up_buffer->to_string());
                 auto alloc_status = m_vdev->commit_blk(buf->m_blkid);
-                allocator_state_changed |= (alloc_status == BlkAllocStatus::SUCCESS);
+                HS_REL_ASSERT_EQ(alloc_status, BlkAllocStatus::SUCCESS, "Unsuccessful commit_blk() in recover()");
                 pending_bufs.push_back(buf->m_up_buffer);
             } else {
                 // Up buffer is not committed, we need to repair it first
@@ -769,8 +768,6 @@ void IndexWBCache::recover(sisl::byte_view sb) {
             }
         }
     }
-
-    m_force_vdev_flush.store(allocator_state_changed, std::memory_order_release);
     m_in_recovery = false;
     m_vdev->recovery_completed();
 }
@@ -852,19 +849,11 @@ folly::Future< bool > IndexWBCache::async_cp_flush(IndexCPContext* cp_ctx) {
     //     cp_ctx->to_string_dot(filename);
     // #endif
     if (!cp_ctx->any_dirty_buffers()) {
-        // For the first CP, we need to flush the journal buffer to the meta blk.
-        // Also after recovery, bitmap could be fixed with no dirty index buffers.
-        const bool force_vdev_flush =
-            (cp_ctx->id() == 0) ||
-            m_force_vdev_flush.exchange(false, std::memory_order_acq_rel);
+        LOGINFO("Flush the vdev to ensure all cp information is created");
+        // Always try to flush, will be a no-op when not needed
+        m_vdev->cp_flush(cp_ctx);
 
-        if (force_vdev_flush) {
-            LOGINFO("Flush the vdev to ensure all cp information is created");
-            m_vdev->cp_flush(cp_ctx);
-        } else {
-            CP_PERIODIC_LOG(DEBUG, unmove(cp_ctx->id()), "Btree does not have any dirty buffers to flush");
-        }
-        cp_ctx->complete(true);
+        cp_ctx->complete(true); 
         return folly::makeFuture< bool >(true); // nothing to flush
     }
 
